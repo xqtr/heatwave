@@ -1,0 +1,4 @@
+numpy>=1.19.0
+SoapySDR>=0.8.0
+scipy>=1.7.0
+Pillow>=8.0.0
