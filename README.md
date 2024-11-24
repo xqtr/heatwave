@@ -69,11 +69,15 @@ The program uses framebuffer for displaying graphics. Make sure your system is c
 
 I wont describe how to enable the use of the framebuffer, as the process differs for each linux distribution/system.
 
+#### Important!
+
+Some devices use 16bit colors for the framebuffer. The program supports both 32bit and 16bit modes, with the use of the --color-mode parameter. If you get an error while initializing the framebuffer change the value of color mode. By default the program starts in 32bit color mode.
+
 ## Usage
 
 Run the script with:
 
-/heatwave.py <start_freq> <end_freq>
+/heatwave.py <start_freq> <end_freq> <--color-mode 16|32>
 
 ### Export Feature (e)
 

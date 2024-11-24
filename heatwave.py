@@ -47,9 +47,15 @@ import select
 from datetime import datetime
 import json
 import os.path
+import fcntl
+import array
 
 class FrequencyHeatmap:
-    def __init__(self, start_freq, end_freq, sample_rate):
+    def __init__(self, start_freq, end_freq, sample_rate=2.4e6, color_mode=32):
+        """Initialize the frequency heatmap display"""
+        # Store color mode
+        self.color_mode = color_mode
+        
         # Remove custom band configuration
         self.config_dir = os.path.expanduser('~/.config/heatwave/')
         os.makedirs(self.config_dir, exist_ok=True)
@@ -260,12 +266,27 @@ class FrequencyHeatmap:
         
         print(f"Framebuffer: {self.width}x{self.height}, {self.bits_per_pixel} bits per pixel")
         
-        # Calculate framebuffer size
+        # Initialize framebuffer
+        self.fb = open('/dev/fb0', 'rb+')
+        self.fb_info = self.get_fix_info()
+        
+        # Set bytes per pixel based on color mode parameter
+        self.bytes_per_pixel = 4 if self.color_mode == 32 else 2
         self.fb_size = self.width * self.height * self.bytes_per_pixel
         
-        # Initialize framebuffer
-        self.fb = open('/dev/fb0', 'r+b')
-        self.fb_data = mmap.mmap(self.fb.fileno(), self.fb_size, mmap.MAP_SHARED)
+        # Create memory mapping for framebuffer
+        try:
+            self.fb_data = mmap.mmap(
+                self.fb.fileno(),
+                self.fb_size,
+                mmap.MAP_SHARED,
+                mmap.PROT_READ | mmap.PROT_WRITE,
+                offset=0
+            )
+        except Exception as e:
+            print(f"Error mapping framebuffer: {e}")
+            # Try fallback with just the file object
+            self.fb_data = self.fb
         
         # Configure RTL-SDR
         self.sdr.setSampleRate(SOAPY_SDR_RX, 0, self.sample_rate)
@@ -1283,29 +1304,24 @@ class FrequencyHeatmap:
         # Convert back to numpy array
         colored = np.array(img)
 
-        # Write to framebuffer
-        if self.bytes_per_pixel == 4:
-            # 32-bit color (unchanged)
+        # Write to framebuffer based on color mode
+        if self.color_mode == 32:
+            # 32-bit color (BGRA)
             fb_array = np.zeros((self.height, self.width, 4), dtype=np.uint8)
             fb_array[..., :3] = colored[..., ::-1]  # RGB -> BGR
-            fb_array[..., 3] = 255
+            fb_array[..., 3] = 255  # Alpha channel
             buffer_data = fb_array.tobytes()[:self.fb_size]
-            self.fb_data.seek(0)
-            self.fb_data.write(buffer_data)
-        elif self.bytes_per_pixel == 2:
-            # Optimized 16-bit color conversion
-            # Convert RGB888 to RGB565 using vectorized operations
+        else:
+            # 16-bit color (RGB565)
             r = (colored[..., 0] >> 3).astype(np.uint16)  # 5 bits for red
             g = (colored[..., 1] >> 2).astype(np.uint16)  # 6 bits for green
             b = (colored[..., 2] >> 3).astype(np.uint16)  # 5 bits for blue
-            
-            # Combine using bit operations (RGB565 format)
             color = ((r << 11) | (g << 5) | b).astype(np.uint16)
-            
-            # Create buffer and write directly
             buffer_data = color.tobytes()
-            self.fb_data.seek(0)
-            self.fb_data.write(buffer_data[:self.fb_size])
+
+        # Write to framebuffer
+        self.fb_data.seek(0)
+        self.fb_data.write(buffer_data[:self.fb_size])
 
     def cleanup(self):
         """Enhanced cleanup of resources"""
@@ -1324,7 +1340,8 @@ class FrequencyHeatmap:
             # Cleanup framebuffer
             if hasattr(self, 'fb_data'):
                 try:
-                    self.fb_data.close()
+                    if isinstance(self.fb_data, mmap.mmap):
+                        self.fb_data.close()
                 except Exception as e:
                     print(f"Error closing framebuffer data: {e}")
             
@@ -1486,50 +1503,60 @@ class FrequencyHeatmap:
         return np.array(img)
 
     def apply_color_scheme(self, values, colored_section):
-        """Apply color scheme consistently across display methods"""
-        if self.color_scheme == 0:  # Default blue-red-yellow gradient
-            values_expanded = values[..., np.newaxis]
-            blue = np.minimum(values * 3, 255)
-            red = np.minimum((values - 85) * 3, 255)
-            red[values < 85] = 0
-            yellow = np.minimum((values - 170) * 3, 255)
-            yellow[values < 170] = 0
-            
-            colored_section[..., 0] = red  # Red channel
-            colored_section[..., 1] = yellow  # Green channel
-            colored_section[..., 2] = blue  # Blue channel
-        
-        elif self.color_scheme == 1:  # Hot
-            colored_section[..., 0] = np.minimum(values * 3, 255)  # Red
-            colored_section[..., 1] = np.where(values > 85, np.minimum((values - 85) * 3, 255), 0)  # Green
-            colored_section[..., 2] = np.where(values > 170, np.minimum((values - 170) * 3, 255), 0)  # Blue
-        
-        elif self.color_scheme == 2:  # Viridis-like
-            colored_section[..., 0] = np.where(values > 170, np.minimum((values - 170) * 3, 255), 0)  # Red
-            colored_section[..., 1] = np.minimum(values * 2, 255)  # Green
-            colored_section[..., 2] = np.where(values < 127,  # Blue
-                np.minimum(values * 2, 255),
-                np.maximum(255 - (values - 127) * 2, 0))
-        
-        elif self.color_scheme == 3:  # Plasma-like
-            colored_section[..., 0] = np.where(values > 85, np.minimum((values - 85) * 3, 255), 0)  # Red
-            colored_section[..., 1] = np.where(values > 170, np.minimum((values - 170) * 3, 255), 0)  # Green
-            colored_section[..., 2] = np.where(values < 127,  # Blue
-                np.minimum(values * 2, 255),
-                np.maximum(255 - (values - 127) * 2, 0))
-        
-        elif self.color_scheme == 4:  # Magma-like
-            colored_section[..., 0] = np.minimum(values * 2, 255)  # Red
-            colored_section[..., 1] = np.where(values > 127, np.minimum((values - 127) * 2, 255), 0)  # Green
-            colored_section[..., 2] = np.where(values < 127,  # Blue
-                np.minimum(values * 2, 255),
-                np.maximum(255 - (values - 127) * 2, 0))
-        
-        elif self.color_scheme == 5:  # Grayscale
-            gray = np.minimum(values, 255)
-            colored_section[..., 0] = gray  # Red
-            colored_section[..., 1] = gray  # Green
-            colored_section[..., 2] = gray  # Blue
+        """Apply enhanced color schemes with black backgrounds"""
+        # Ensure values are within 0-255 range and normalize
+        values = np.clip(values, 0, 255).astype(np.float32) / 255.0
+
+        # Set everything to black first
+        colored_section.fill(0)
+
+        # Apply threshold to ensure black background
+        threshold = 0.05  # Values below this will be black
+        mask = values > threshold
+
+        if self.color_scheme == 0:  # Enhanced spectrum (black through blue-red-yellow)
+            colored_section[mask, 0] = np.clip((2.5 * values[mask] - 0.5) * 255, 0, 255).astype(np.uint8)  # Red
+            colored_section[mask, 1] = np.clip((3 * values[mask] - 1.5) * 255, 0, 255).astype(np.uint8)    # Green
+            colored_section[mask, 2] = np.clip((1 - values[mask]) * 255, 0, 255).astype(np.uint8)          # Blue
+
+        elif self.color_scheme == 1:  # Enhanced thermal (black-red-yellow-white)
+            colored_section[mask, 0] = np.clip(2.5 * values[mask] * 255, 0, 255).astype(np.uint8)          # Red
+            colored_section[mask, 1] = np.clip((3 * values[mask] - 1.2) * 255, 0, 255).astype(np.uint8)    # Green
+            colored_section[mask, 2] = np.clip((4 * values[mask] - 2.5) * 255, 0, 255).astype(np.uint8)    # Blue
+
+        elif self.color_scheme == 2:  # Enhanced viridis-inspired (black to bright)
+            colored_section[mask, 0] = np.clip((3 * values[mask] - 1.5) * 255, 0, 255).astype(np.uint8)    # Red
+            colored_section[mask, 1] = np.clip(2 * values[mask] * 255, 0, 255).astype(np.uint8)            # Green
+            colored_section[mask, 2] = np.clip((1 - values[mask] ** 2) * 255, 0, 255).astype(np.uint8)     # Blue
+
+        elif self.color_scheme == 3:  # Enhanced plasma-inspired (black base)
+            colored_section[mask, 0] = np.clip(2 * values[mask] * 255, 0, 255).astype(np.uint8)            # Red
+            colored_section[mask, 1] = np.clip((values[mask] ** 2) * 255, 0, 255).astype(np.uint8)         # Green
+            colored_section[mask, 2] = np.clip((1 - values[mask]) * 255, 0, 255).astype(np.uint8)          # Blue
+
+        elif self.color_scheme == 4:  # Enhanced magma-inspired (black to bright)
+            colored_section[mask, 0] = np.clip(2 * values[mask] * 255, 0, 255).astype(np.uint8)            # Red
+            colored_section[mask, 1] = np.clip((values[mask] ** 2) * 255, 0, 255).astype(np.uint8)         # Green
+            colored_section[mask, 2] = np.clip((values[mask] ** 0.5) * 255, 0, 255).astype(np.uint8)       # Blue
+
+        elif self.color_scheme == 5:  # Enhanced grayscale with gamma correction
+            gray = np.clip(values ** 0.8 * 255, 0, 255).astype(np.uint8)
+            gray[values <= threshold] = 0  # Ensure black background
+            colored_section[..., 0] = gray
+            colored_section[..., 1] = gray
+            colored_section[..., 2] = gray
+
+        # Add intensity boost for stronger signals
+        if self.color_mode == 32:  # Only apply for 32-bit mode
+            boost_mask = values > 0.8  # Boost very strong signals
+            if boost_mask.any():
+                boost_factor = 1.2  # Intensity boost factor
+                for i in range(3):
+                    colored_section[boost_mask, i] = np.clip(
+                        colored_section[boost_mask, i] * boost_factor, 
+                        0, 
+                        255
+                    ).astype(np.uint8)
 
     def show_help(self):
         """Display help information with pagination"""
@@ -2089,12 +2116,73 @@ l       - Load saved settings"""
         
         return None
 
+    def get_fix_info(self):
+        """Get framebuffer fixed information"""
+        # Define the ioctl command for FBIOGET_FSCREENINFO
+        FBIOGET_FSCREENINFO = 0x4602
+
+        # Create a larger buffer to accommodate different structure sizes
+        fix_info = array.array('B', [0] * 256)  # Use larger buffer
+        
+        try:
+            # Get the fixed screen info
+            fcntl.ioctl(self.fb, FBIOGET_FSCREENINFO, fix_info)
+            
+            # Different format strings for different architectures
+            formats = [
+                ('16s8s16sIIIHHHHHBx7x', 68),   # Common format
+                ('16s8s16sIIIHHHHHBxxxxx7x', 71), # Some 64-bit systems
+                ('16s8s16sIIIHHHHHBxxxxxxx7x', 72) # Other variants
+            ]
+            
+            # Try different formats until one works
+            for fmt, size in formats:
+                try:
+                    unpacked = struct.unpack(fmt, fix_info[:size])
+                    # Create a dictionary with the information we need
+                    info = {
+                        'id_name': unpacked[0].decode('ascii').strip('\x00'),
+                        'smem_len': unpacked[4],  # Length of frame buffer mem
+                        'type': unpacked[5],      # see FB_TYPE_*
+                        'type_aux': unpacked[6],  # Interleave for interleaved Planes
+                        'visual': unpacked[7],    # see FB_VISUAL_*
+                        'line_length': unpacked[9] # length of a line in bytes
+                    }
+                    return info
+                except struct.error:
+                    continue
+            
+            # If no format worked, fall back to defaults
+            print("Warning: Could not get framebuffer info, using defaults")
+            return {
+                'id_name': 'unknown',
+                'smem_len': self.width * self.height * self.bytes_per_pixel,
+                'type': 0,
+                'type_aux': 0,
+                'visual': 0,
+                'line_length': self.width * self.bytes_per_pixel
+            }
+            
+        except IOError as e:
+            print(f"Error getting framebuffer info: {e}")
+            # Return sensible defaults
+            return {
+                'id_name': 'unknown',
+                'smem_len': self.width * self.height * self.bytes_per_pixel,
+                'type': 0,
+                'type_aux': 0,
+                'visual': 0,
+                'line_length': self.width * self.bytes_per_pixel
+            }
+
 def main():
     parser = argparse.ArgumentParser(description='RTL-SDR Frequency Heatmap')
     parser.add_argument('start_freq', type=float, help='Start frequency in MHz')
     parser.add_argument('end_freq', type=float, help='End frequency in MHz')
     parser.add_argument('--sample-rate', type=float, default=2.4,
                         help='Sample rate in MHz (default: 2.4)')
+    parser.add_argument('--color-mode', type=int, choices=[16, 32], default=32,
+                        help='Framebuffer color mode (16 or 32 bits, default: 32)')
     args = parser.parse_args()
 
     # Convert MHz to Hz
@@ -2102,7 +2190,7 @@ def main():
     end_freq = args.end_freq * 1e6
     sample_rate = args.sample_rate * 1e6
 
-    heatmap = FrequencyHeatmap(start_freq, end_freq, sample_rate)
+    heatmap = FrequencyHeatmap(start_freq, end_freq, sample_rate, color_mode=args.color_mode)
     
     try:
         while True:
